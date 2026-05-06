@@ -1,0 +1,101 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+% Code listing style
+\lstset{
+    language=C,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    stringstyle=\color{red},
+    commentstyle=\color{teal},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    stepnumber=1,
+    breaklines=true,
+    frame=single,
+    showstringspaces=false
+}
+
+\title{COMP25212: Optimisation of Matrix Multiplication \\ \large Performance Analysis and Hardware Tailoring}
+\author{Hufsa Haq, Student ID: 11577383}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+
+
+\section{Part I: Profiling and Independent Optimisations}
+
+\subsection{Processor Information}
+The experiments were conducted on a Linux system equipped with an Intel Core i7-8700 processor. Based on system diagnostics (\texttt{lscpu}), this CPU has 6 physical cores and 12 logical threads via Hyper-Threading. Key architectural features relevant to matrix multiplication include:
+\begin{itemize}
+    \item \textbf{Cache Hierarchy:} The processor contains L1 (32 KB Data), L2 (256 KB), and L3 (12 MB) caches. Matrix multiplication processes elements in row-major order; as matrices grow beyond the L3 cache capacity, memory bandwidth becomes the primary bottleneck.
+    \item \textbf{Multicore Processing:} The presence of 6 physical cores allows for thread-level parallelisation of the outer loop iterations.
+    \item \textbf{Vector Extensions:} Support for x86-64 AVX (Advanced Vector Extensions) enables Single Instruction Multiple Data (SIMD) execution. The 256-bit registers allow the CPU to perform floating-point operations on four 64-bit double-precision operands simultaneously.
+\end{itemize}
+
+\subsection{Baseline Performance}
+The baseline evaluation uses the naive \texttt{matrix\_multiply()} function consisting of three nested loops. For matrices $A$, $B$, and $C$, the number of floating-point operations (FLOP) is calculated as $FLOP=LN(2M-1)$. Given our focus on square matrices where $L=M=N$, this simplifies to $FLOP=N^2(2N-1)$.
+
+Using the \texttt{square\_mm\_profile.sh} script, matrices from $N=128$ up to $N=2560$ (in increments of 128) were tested. Dividing the computed FLOP by the execution time yields the FLOPS rate. Observation shows that for small matrices ($N < 256$), the operation is heavily cache-resident, maintaining a relatively steady FLOPS rate. However, as $N$ increases, performance degrades sharply. This degradation is asymmetric; iterating over the columns of $B$ in the innermost loop forces non-contiguous memory access, causing a high rate of L1 cache misses. 
+
+\subsection{Compiler Optimisation}
+Modern compilers modify code paths to optimise for speed or size. By modifying the \texttt{\$(OPT)} flag in the makefile, we tested \texttt{-O0}, \texttt{-O1}, \texttt{-O2}, and \texttt{-O3}. 
+
+With \texttt{-O0}, no optimisations are applied. Moving to \texttt{-O3} forces the GCC compiler to aggressively inline, automatically unroll loops, and attempt auto-vectorisation. Inspection of the generated \texttt{main.s} assembly file revealed that \texttt{-O3} replaced scalar arithmetic instructions with packed vector equivalents where loop dependencies allowed. \texttt{-O3} acts as the baseline for the remainder of the tests to isolate our manual architectural tailoring.
+
+\subsection{Loop Unrolling}
+Loop unrolling reduces loop control overhead (incrementing counters and branch testing) and provides the CPU's dynamic scheduler with a larger window of independent instructions to dispatch. 
+
+Testing the \texttt{unrolled\_matrix\_multiply()} function with \texttt{UNROLL=4} showed measurable improvements over the baseline \texttt{-O0} execution. The assembly code verified fewer jump (\texttt{jmp} or \texttt{jle}) instructions per calculated element. However, when combined with \texttt{-O3}, manual unrolling provided negligible gains since the compiler already implements an optimal unrolling strategy based on the specific CPU architecture.
+
+\subsection{Multicore (Thread-Level Parallelism)}
+To exploit the 6-core architecture, OpenMP was utilised to split the outermost loop computations across threads using the \texttt{\#pragma omp parallel for} directive. 
+
+By altering \texttt{OMP\_THREADS}, execution time scaled near-linearly from 1 to 6 threads. Activating threads 7 through 12 provided diminishing returns. This is expected behaviour: while Hyper-Threading allows two logical threads to share a core, matrix multiplication is compute-bound and quickly saturates the shared FPU execution ports, meaning the additional logical threads stall waiting for hardware resources.
+
+\subsection{Blocking (Cache Optimisation)}
+The \texttt{blocked\_matrix\_multiply()} implementation handles data in sub-blocks defined by \texttt{BLOCK\_SIZE}. This keeps chunks of matrices $A$ and $B$ resident in the fast L1/L2 caches for the duration of their computation, dramatically reducing trips to main memory.
+
+Testing block sizes of 16, 32, and 64 revealed that \texttt{BLOCK\_SIZE=32} provides near-optimal performance for the Core i7-8700. A block of $32 \times 32$ double-precision floats requires 8 KB of memory. Three such blocks (for A, B, and C) require 24 KB, which fits comfortably within the 32 KB L1 data cache, minimising eviction events.
+
+\subsection{SIMD (Subword Parallelism)}
+SIMD operations execute a single instruction across a vector of data. We used the \texttt{subword\_parallelism\_matrix\_multiply()} function, explicitly mapping the inner loop arithmetic to AVX 256-bit hardware registers using Intel C intrinsics.
+
+Four 64-bit double-precision variables are processed simultaneously using \texttt{\_mm256\_load\_pd}, \texttt{\_mm256\_add\_pd}, and \texttt{\_mm256\_mul\_pd}. To prevent segmentation faults, the matrices were initialised with 32-byte memory alignment via \texttt{aligned\_alloc()} driven by the \texttt{MEM\_ALIGN} parameter. This optimisation roughly quadrupled instruction throughput in the inner loop compared to strictly scalar processing.
+
+\section{Part II: Combined Optimisation}
+The optimisations tested in Part I target different bottlenecks: OpenMP distributes work, blocking reduces memory latency, and SIMD increases raw compute throughput. To achieve maximum performance, we wrote a combined kernel. 
+
+\subsection{Implementation Strategy}
+The combined approach modifies the blocked structure to divide the matrix into L1-cache friendly tiles. The outer tile traversal is multithreaded using OpenMP, ensuring each thread works on a separate, independent block of matrix $C$. Finally, the innermost loop—which calculates the dot product for a given block—is processed using the \texttt{\_mm256} AVX intrinsics. 
+
+\begin{lstlisting}[caption={Pseudocode snippet for combined optimisation}]
+#pragma omp parallel for collapse(2)
+for(int sj=0; sj<L; sj+=BLOCK_SIZE) {
+    for(int si=0; si<N; si+=BLOCK_SIZE) {
+        for(int sk=0; sk<M; sk+=BLOCK_SIZE) {
+            // Inner SIMD loop operating on block bounds
+            do_block_avx(si, sj, sk, A, B, C);
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Results and Speed-up}
+Care was taken to ensure the matrix dimensions $N$ were multiples of both \texttt{BLOCK\_SIZE} and the SIMD stride (4). 
+
+The resulting FLOPS curve demonstrates that the combined application maintains high execution speeds regardless of matrix dimensions, effectively flattening the severe performance drop observed in the baseline algorithm. Compared to the naive \texttt{-O0} baseline, the combined hardware-tailored program yielded an approximate $40\times$ to $50\times$ overall speed-up on the Core i7 architecture, proving the necessity of comprehensive architectural targeting for intensive mathematical computing tasks.
+
+\end{document}
