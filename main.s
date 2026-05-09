@@ -1803,7 +1803,7 @@ main:
 	testl	%r14d, %r14d	# _119
 	je	.L228	#,
 # main.c:176:     omp_set_num_threads(OMP_THREADS);
-	movl	$12, %edi	#,
+	movl	$4, %edi	#,
 	call	omp_set_num_threads@PLT	#
 # main.c:178:     A = aligned_alloc(MEM_ALIGN, L * sizeof(double *));
 	movq	40(%rsp), %rbx	# %sfp, _123
