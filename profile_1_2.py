@@ -1,54 +1,78 @@
 import subprocess
+import re
 import matplotlib.pyplot as plt
-import pandas as pd
+import sys
+import os
 
 # Task 1.2 - baseline performance profiler
-# run from the directory containing matrix_multiply.out
 
 BINARY       = "./matrix_multiply.out"
-PROGRAM_RUN  = BINARY + " {} {} {} {} {}"   # L M N seed method
-SEED         = 1234
-METHOD       = 0    # 0 = baseline matrix_multiply()
+SEED         = 0
+METHOD       = 0
 MIN_DIM      = 128
 MAX_DIM      = 2048
 STEP         = 128
-REPEAT_COUNT = 3    # average over this many runs per size
+TIMEOUT_S    = 120
+REPEAT_COUNT = 3
 
-def run_test(L: int, M: int, N: int) -> list[float]:
-    """Run one experiment and return [L, M, N, method, time_seconds]."""
-    cmd = PROGRAM_RUN.format(max(L, 1), max(M, 1), max(N, 1), SEED, METHOD)
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    # output: "L = x, M = x, N = x, METHOD = x, EXEC TIME: s.us"
-    fields = [x.strip() for x in result.stdout.split(",")]
-    return [float(x.split(" ")[-1]) for x in fields]
+def flop_count(L, M, N):
+    return L * N * (2 * M - 1)
+
+def run_once(n):
+    """Run the binary for NxNxN and return elapsed seconds, or None on failure."""
+    cmd = [BINARY, str(n), str(n), str(n), str(SEED), str(METHOD)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"  N={n}: timed out after {TIMEOUT_S}s, stopping here")
+        return None
+    if result.returncode != 0:
+        print(f"  ERROR: {result.stderr.strip()}", file=sys.stderr)
+        return None
+    match = re.search(r"EXEC TIME:\s*(\d+)\.(\d+)", result.stdout)
+    if not match:
+        print(f"  Could not parse: {result.stdout.strip()}", file=sys.stderr)
+        return None
+    return int(match.group(1)) + int(match.group(2)) * 1e-6
+
+def main():
+    if not os.path.isfile(BINARY):
+        sys.exit(f"Binary not found: {BINARY}  -  run 'make' first")
+
+    os.makedirs("graphs", exist_ok=True)
+    sizes, flops_list = [], []
+
+    print(f"{'N':>6}  {'Time (s)':>12}  {'FLOPS':>14}")
+    print("-" * 38)
+
+    for n in range(MIN_DIM, MAX_DIM + 1, STEP):
+        time_total = 0.0
+        for _ in range(REPEAT_COUNT):
+            elapsed = run_once(n)
+            if elapsed is None:
+                sys.exit("Stopping early.")
+            time_total += elapsed
+        time = time_total / REPEAT_COUNT
+        flops = flop_count(n, n, n) / time if time != 0 else 0
+        sizes.append(n)
+        flops_list.append(flops)
+        print(f"{n:>6}  {time:>12.6f}  {flops:>14.2f}")
+
+    if not sizes:
+        sys.exit("No data collected.")
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(sizes, flops_list, marker="o", linewidth=1.8, markersize=5,
+            color="#1f77b4", label="baseline matrix_multiply()")
+    ax.set_xlabel("Matrix dimension N  (N x N square)", fontsize=12)
+    ax.set_ylabel("Performance (FLOPS) ", fontsize=12)
+    ax.set_title("Task 1.2 - Baseline matrix multiply: FLOPS vs matrix size", fontsize=12)
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    fig.savefig("graphs/task1_2_baseline_flops.png", dpi=150)
+    print("\nPlot saved to graphs/task1_2_baseline_flops.png")
+    plt.show()
 
 if __name__ == "__main__":
-    data = []
-
-    for dim in range(MIN_DIM, MAX_DIM + 1, STEP):
-        print(f"Running N={dim}")
-        time_total = 0.0
-        L = M = N = 0
-
-        for _ in range(REPEAT_COUNT):
-            res = run_test(dim, dim, dim)
-            L, M, N = int(res[0]), int(res[1]), int(res[2])
-            time_total += res[4]   # res[3] is METHOD, res[4] is EXEC TIME
-
-        time  = time_total / REPEAT_COUNT
-        flops = float(L * N * (2 * M - 1)) / time if time != 0 else 0
-        data.append([flops, L])
-        print(f"  avg time: {time:.4f}s  FLOPS: {flops:.0f}")
-
-    df = pd.DataFrame(data, columns=["FLOPS", "Dimension"])
-
-    figure, axis = plt.subplots(figsize=(9, 5))
-    axis.set_xlabel("Matrix Dimension N")
-    axis.set_ylabel("FLOPS")
-    axis.set_title("Task 1.2 - Baseline matrix multiply: FLOPS vs matrix size")
-    axis.grid(True, alpha=0.6)
-    axis.plot(df["Dimension"], df["FLOPS"], marker="o", linewidth=2, markersize=5)
-    plt.tight_layout()
-    plt.savefig("graphs/1_2_baseline.png", dpi=200)
-    print("Plot saved to graphs/1_2_baseline.png")
-    plt.show()
+    main()
